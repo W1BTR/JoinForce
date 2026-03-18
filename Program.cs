@@ -24,10 +24,47 @@ namespace JoinForce
         internal static readonly string ExeDir =
             Path.GetDirectoryName(ExePath);
 
+        // Local config next to the exe (what the GUI edits)
         internal static readonly string ConfigPath =
             Path.Combine(ExeDir, "joinforce.cfg");
 
+        // Pointer file in ProgramData — tells the service where to find the config
+        internal static readonly string PointerDir =
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "JoinForce");
+
+        internal static readonly string PointerFile =
+            Path.Combine(PointerDir, "config_path.txt");
+
         internal static readonly string ServiceName = "JoinForce";
+
+        /// <summary>
+        /// Reads the pointer file to get the active config path.
+        /// Falls back to the config next to the exe if pointer is missing.
+        /// </summary>
+        internal static string ResolveServiceConfigPath()
+        {
+            try
+            {
+                if (File.Exists(PointerFile))
+                {
+                    var path = File.ReadAllText(PointerFile).Trim();
+                    if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                        return path;
+                }
+            }
+            catch { }
+            return ConfigPath;
+        }
+
+        /// <summary>
+        /// Writes the pointer file so the service knows which config to use.
+        /// </summary>
+        internal static void SetDefaultConfig(string configAbsolutePath)
+        {
+            if (!Directory.Exists(PointerDir))
+                Directory.CreateDirectory(PointerDir);
+            File.WriteAllText(PointerFile, configAbsolutePath);
+        }
 
         [STAThread]
         static void Main(string[] args)
@@ -139,16 +176,18 @@ namespace JoinForce
                 handler(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg);
         }
 
-        // --- Config file reader (shared between GUI load and service) ---
-        public static void ReadConfig(out string nicIp, out int intervalMinutes, out List<string> groups)
+        /// <summary>
+        /// Reads a config file at the given path.
+        /// </summary>
+        public static void ReadConfig(string configPath, out string nicIp, out int intervalMinutes, out List<string> groups)
         {
             nicIp = "";
             intervalMinutes = 5;
             groups = new List<string>();
 
-            if (!File.Exists(Program.ConfigPath)) return;
+            if (!File.Exists(configPath)) return;
 
-            foreach (var line in File.ReadAllLines(Program.ConfigPath))
+            foreach (var line in File.ReadAllLines(configPath))
             {
                 var eq = line.IndexOf('=');
                 if (eq < 0) continue;
@@ -186,12 +225,16 @@ namespace JoinForce
 
         protected override void OnStart(string[] args)
         {
-            _logPath = Path.Combine(Program.ExeDir, "joinforce_service.log");
+            // Resolve config via the pointer file
+            var cfgPath = Program.ResolveServiceConfigPath();
+            _logPath = Path.Combine(Path.GetDirectoryName(cfgPath), "joinforce_service.log");
+
+            WriteLog("Service starting. Config: " + cfgPath);
 
             string nicIp;
             int interval;
             List<string> groups;
-            JoinEngine.ReadConfig(out nicIp, out interval, out groups);
+            JoinEngine.ReadConfig(cfgPath, out nicIp, out interval, out groups);
 
             if (groups.Count == 0)
             {
@@ -256,17 +299,14 @@ namespace JoinForce
                 " binPath= " + binPath +
                 " start= auto" +
                 " DisplayName= \"JoinForce IGMP Join Service\"");
-            // Set description
             RunSc("description " + Program.ServiceName +
                 " \"Periodically sends IGMP join requests for configured multicast groups.\"");
-            // Set recovery: restart on failure
             RunSc("failure " + Program.ServiceName + " reset= 60 actions= restart/5000");
             Console.WriteLine(result);
         }
 
         public static void Uninstall()
         {
-            // Stop first, ignore errors
             RunSc("stop " + Program.ServiceName);
             System.Threading.Thread.Sleep(1500);
             var result = RunSc("delete " + Program.ServiceName);
@@ -311,7 +351,9 @@ namespace JoinForce
         private TextBox _logBox;
         private Button _saveBtn;
         private Button _loadBtn;
+        private Button _setDefaultBtn;
         private Label _statusLabel;
+        private Label _defaultCfgLabel;
         private Button _installSvcBtn;
         private Button _uninstallSvcBtn;
         private Button _startSvcBtn;
@@ -325,8 +367,8 @@ namespace JoinForce
         public MainForm()
         {
             Text = "JoinForce — IGMP Join Sender — By Lucas Elliott";
-            Size = new Size(560, 600);
-            MinimumSize = new Size(520, 560);
+            Size = new Size(560, 640);
+            MinimumSize = new Size(520, 600);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 9f);
 
@@ -334,6 +376,7 @@ namespace JoinForce
             PopulateNics();
             LoadConfig();
             UpdateServiceStatus();
+            UpdateDefaultLabel();
 
             FormClosing += (s, e) => StopLocal();
         }
@@ -406,7 +449,7 @@ namespace JoinForce
             Controls.Add(_intervalNum);
             y += 32;
 
-            // --- Save / Load / Start (local) ---
+            // --- Save / Load / Set Default / Start (local) ---
             _saveBtn = new Button { Text = "Save Config", Location = new Point(pad, y), Width = 90 };
             _saveBtn.Click += (s, e) => SaveConfig();
             Controls.Add(_saveBtn);
@@ -414,6 +457,10 @@ namespace JoinForce
             _loadBtn = new Button { Text = "Load Config", Location = new Point(110, y), Width = 90 };
             _loadBtn.Click += (s, e) => LoadConfig();
             Controls.Add(_loadBtn);
+
+            _setDefaultBtn = new Button { Text = "Set as Default", Location = new Point(210, y), Width = 100 };
+            _setDefaultBtn.Click += (s, e) => SetAsDefault();
+            Controls.Add(_setDefaultBtn);
 
             _startStopBtn = new Button
             {
@@ -428,7 +475,18 @@ namespace JoinForce
             };
             _startStopBtn.Click += (s, e) => ToggleStartStop();
             Controls.Add(_startStopBtn);
-            y += 36;
+            y += 34;
+
+            // --- Default config indicator ---
+            _defaultCfgLabel = new Label
+            {
+                Location = new Point(pad, y),
+                AutoSize = true,
+                ForeColor = Color.Gray,
+                Font = new Font("Segoe UI", 8f)
+            };
+            Controls.Add(_defaultCfgLabel);
+            y += 20;
 
             // --- Status ---
             _statusLabel = new Label
@@ -612,11 +670,60 @@ namespace JoinForce
             _nicCombo.Enabled = true;
         }
 
+        // ---- Default config pointer ----
+
+        private void SetAsDefault()
+        {
+            try
+            {
+                SaveConfig();
+                Program.SetDefaultConfig(Path.GetFullPath(Program.ConfigPath));
+                UpdateDefaultLabel();
+                Log("Set as default service config: " + Program.ConfigPath);
+            }
+            catch (Exception ex)
+            {
+                Log("Failed to set default: " + ex.Message);
+            }
+        }
+
+        private void UpdateDefaultLabel()
+        {
+            try
+            {
+                if (File.Exists(Program.PointerFile))
+                {
+                    var pointed = File.ReadAllText(Program.PointerFile).Trim();
+                    var current = Path.GetFullPath(Program.ConfigPath);
+                    if (pointed.Equals(current, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _defaultCfgLabel.Text = "This config is the service default.";
+                        _defaultCfgLabel.ForeColor = Color.Green;
+                    }
+                    else
+                    {
+                        _defaultCfgLabel.Text = "Service default: " + pointed;
+                        _defaultCfgLabel.ForeColor = Color.FromArgb(180, 140, 0);
+                    }
+                }
+                else
+                {
+                    _defaultCfgLabel.Text = "No service default set. Click \"Set as Default\" to configure.";
+                    _defaultCfgLabel.ForeColor = Color.Gray;
+                }
+            }
+            catch
+            {
+                _defaultCfgLabel.Text = "";
+            }
+        }
+
         // ---- Service management ----
 
         private void InstallService()
         {
             SaveConfig();
+            SetAsDefault();
             Log("Installing service...");
             var binPath = "\"" + Program.ExePath + "\" --service";
             var r1 = ServiceHelper.RunSc("create " + Program.ServiceName +
@@ -643,6 +750,7 @@ namespace JoinForce
         private void StartService()
         {
             SaveConfig();
+            SetAsDefault();
             Log("Starting service...");
             var r = ServiceHelper.RunSc("start " + Program.ServiceName);
             Log(r);
@@ -662,6 +770,7 @@ namespace JoinForce
         private void ApplyAndRestartService()
         {
             SaveConfig();
+            SetAsDefault();
             Log("Applying config and restarting service...");
             ServiceHelper.RunSc("stop " + Program.ServiceName);
             System.Threading.Thread.Sleep(2000);
@@ -749,7 +858,7 @@ namespace JoinForce
             string nicIp;
             int interval;
             List<string> groups;
-            JoinEngine.ReadConfig(out nicIp, out interval, out groups);
+            JoinEngine.ReadConfig(Program.ConfigPath, out nicIp, out interval, out groups);
 
             _groupList.Items.Clear();
             foreach (var g in groups)
